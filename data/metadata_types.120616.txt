@@ -1,0 +1,202 @@
+metadata_variable	type	baseline	useForPERMANOVA	useForLCA	useForNB
+demo_date	date				
+PID	factor		yes		
+age_of_visit	numeric		yes		
+Latino	factor				
+DOB	date				
+Assay_ID	factor				
+biomarker_date	date				
+visit_code	factor				
+Sample_Type	factor				
+Condition	factor				
+IFNg_pgmL	numeric				no
+IL_1b_pgmL	numeric				no
+IL_6_pgmL	numeric				yes
+IL_8_pgmL	numeric				yes
+IL_8_pgmL_binned	factor	low			no
+IL_10_pgmL	numeric				no
+IL_12_p70__pgml	numeric				no
+IL_18__pgml	numeric				yes
+MCP_1__pgml	numeric				yes
+MIP_1a__pg_mL_	numeric				no
+CD163__ng_mL_	numeric				yes
+CD27__ng_mL_	numeric				yes
+IL_2Ra__ng_mL_	numeric				yes
+IL_6Ra__ng_mL_	numeric				yes
+Pentraxin_3__ng_mL_	numeric				yes
+pg130__ng_mL_	numeric				yes
+TNFRII__ng_mL_	numeric				yes
+CXCL13__pgml	numeric				yes
+IP_10__pgml	numeric				yes
+TREM_1__pgml	numeric				yes
+CD14__ugml	numeric				yes
+SAA1__ugml	numeric				yes
+BAFF__ngml	numeric				yes
+FABP2__ngml	numeric				yes
+LBP__ngml	numeric				yes
+s100A8_s100A9__ugml	numeric				yes
+hivtox_date	date				
+viral_load	numeric				
+drug_test	factor				
+Methamphetamine	factor				
+Opiates	factor				
+Cocaine	factor				
+Nitrites	factor				
+Ecstasy	factor				
+Marijuana	factor				
+Amphetamines	factor				
+viral_load_oldform	numeric				
+log_viral_load	numeric				no
+viral_load_binned	factor	[0,1e+04)	no		no
+viral_load_binned2	factor	[0,1e+05)	no		yes
+viral_load_timepoints		undetectable_in_both	no		no
+state	factor				
+wbc	numeric				
+wbc1	factor				
+wbc_normval	factor				
+wbc_comment	character				
+hematocrit	numeric				
+hematocrit1	factor				
+hematocrit_normval	factor				
+hematocrit_comment	character				
+platelets	numeric				
+platelets1	factor				
+platelets_normval	factor				
+platelets_comment	character				
+ab_neutrophils	numeric		yes		yes
+ab_neutrophils1	factor	norm		yes	
+ab_neutrophils_normval	factor				
+ab_neutrophils_comment	character				
+glucose	numeric				
+glucose1	factor				
+glucose_normval	factor				
+glucose_comment	character				
+bun	numeric				
+bun1	factor				
+bun_normval	factor				
+bun_comment	character				
+creatinine	numeric				
+creatinine1	factor				
+creatinine_normval	factor				
+creatinine_comment	character				
+sodium	numeric				
+sodium1	factor				
+sodium_normval	factor				
+sodium_comment	character				
+potassium	numeric				
+potassium1	factor				
+potassium_normval	factor				
+potassium_comment	character				
+albumin	numeric				
+albumin1	factor				
+albumin_normval	factor				
+albumin_comment	character				
+bilirubin	numeric				
+bilirubin1	factor				
+bilirubin_normval	factor				
+bilirubin_comment	character				
+ast	numeric				
+ast1	factor				
+ast_normval	factor				
+ast_comment	character				
+alt	numeric				
+alt1	factor				
+alt_normval	factor				
+alt_comment	character				
+ab_cd4_helper	numeric				
+ab_cd4_helper_na	factor				
+ab_cd4_helper1	factor				
+ab_cd4_helper2	factor	[351,1e+04)	yes	yes	yes
+ab_cd4_helper_normval	factor				
+ab_cd4_helper_comment	character				
+per_cd4_pos_lymph	numeric				
+per_cd4_pos_lymph_na	factor				
+per_cd4_pos_lymph1	factor				
+per_cd4_pos_lymph_normval	factor				
+per_cd4_pos_lymph_comment	character				
+hemoglobin	numeric				
+hemoglobin1	factor				
+hemoglobin_normval	factor				
+hemoglobin_comment	character				
+hepbsab	factor				
+hepbsab_comment	character				
+hepbsag	factor				
+hepbsag_comment	character				
+hepbcab_igm	factor				
+hepbcab_igm_comment	character				
+hep_b	factor				
+hep_b_comment	character				
+hep_c	factor				
+hep_c_comment	character				
+hepatitis_c	factor				
+hepatitis_c_comment	character				
+lab_date	date				
+created_date	date				
+chbi_hbs	factor				
+chbi_hbs_comment	character				
+DATE	date				
+LABSDONE	factor				
+Q4	factor				
+Q185	factor	6			
+Q185_TEXT	character				
+Q13	factor				
+Q15	factor	No			
+Q16	factor				
+Q186	factor				
+Q186_0	factor	No			
+Q74	factor	No			
+Q75	factor	No			
+Q78	factor	no			
+Q92	numeric				
+Q99_1_TEXT	numeric				
+Q99_2_TEXT	numeric				
+Q99_CLEAN	numeric		no		no
+Q99_BINARY	factor	No	yes	yes	yes
+Q103	factor	never		no	no
+Q104	factor	never		no	no
+Q103_BINARY	factor	No	yes		yes
+Q104_BINARY	factor	No	yes		yes
+Q151	numeric	0	no		yes
+Q157_1	factor	never	no	no	no
+Q157_2	factor	never	no	no	no
+Q157_3	factor	never	no	no	no
+Q157_4	factor	never	no	no	no
+Q157_5	factor	never	no	no	no
+Q157_6	factor	never	no	no	no
+Q157_7	factor	never	no	no	no
+Q157_8	factor	never	no	no	no
+Q157_9	factor	never	no	no	no
+Q157_10	factor	never	no	no	no
+Q157_11	factor	never	no	no	no
+Q157_1_binned	factor	No	yes	no	yes
+Q157_2_binned	factor	No	yes	no	yes
+Q157_3_binned	factor	No	yes	no	yes
+Q157_4_binned	factor	No	yes	no	yes
+Q157_5_binned	factor	No	yes	no	yes
+Q157_6_binned	factor	No	yes	no	yes
+Q157_7_binned	factor	No	yes	yes	yes
+Q157_8_binned	factor	No	yes	no	yes
+Q157_9_binned	factor	No	yes	no	yes
+Q157_10_binned	factor	No	yes	no	yes
+Q157_11_binned	factor	No	yes	no	yes
+Q187	factor	never			no
+Q164_1_TEXT	numeric	0			
+Q164_2_TEXT	numeric	0			
+Q164_3_TEXT	numeric	0			
+Q164_4_TEXT	numeric	0			
+Q164_5_TEXT	numeric	0			
+Q165	factor	No			
+Q166	factor	No			
+race_ethnicity	factor				
+behav_date	date				
+urine_gonorrhea	factor	negative			no
+rectal_swab_gonorrhea	factor	negative			no
+throat_swab_gonorrhea	factor	negative			no
+anygonorrhea	factor	negative	yes	yes	yes
+Weight	numeric				no
+Height_inches	numeric				no
+bmi	numeric				no
+hiv	factor				
+hiv_diagnosis	date				
+LCA	factor				no
+MethMarijuana	factor	MethNo_MariNo	no	no	no

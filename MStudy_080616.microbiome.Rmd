@@ -1,0 +1,667 @@
+---
+title: "Effects of substance use and sexual practices on the intestinal microbiome during HIV-1 infection"
+author: Fan Li
+date: December 13, 2017
+output:
+  html_document:
+    keep_md: true
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+---
+
+This document describes the analyses corresponding to the manuscripts "Effects of substance use and sexual practices on the intestinal microbiome during HIV-1 infection" (Fulcher et al) and "" (Hussain et al). All figures and analyses presented in both papers are reproduced by the following R code.
+
+***
+# Setup
+We will start with the `sequence variant (SV) table` and `taxonomy` generated using DADA2 and `mapping file` compiled by hand. These are available [here](data/).
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE)
+```
+
+We will mainly use the `phyloseq` and `vegan` packages for analysis. Let's go ahead and get all the necessary packages loaded. Note that we will also make use of some functions in the `utils.R` script. 
+
+### Load packages
+```{r load_packages, eval=TRUE, warning=FALSE, message=FALSE}
+library(ggplot2)
+library(ape)
+library(plyr)
+library(reshape2)
+library(cluster)
+library(RColorBrewer)
+library(phyloseq)
+library(grid)
+library(gridExtra)
+library(gplots)
+library(vegan)
+library(parallel)
+library(useful)
+library(pscl)
+library(MASS)
+library(knitr)
+
+source("utils.R")
+
+distance_metrics <- c("bray", "jaccard", "jsd")
+alpha_metrics <- c("Chao1", "Shannon", "Simpson", "Observed")
+ncores <- 16
+```
+
+### Load data
+Read in SV table, mapping file, and color chart. All of these are available [here](data/).
+
+```{r load_data, eval=TRUE, warning=FALSE, message=FALSE}
+out_dir <- "data"
+full_mapping_fn <- sprintf("%s/MStudy_Mapping.082216.txt", out_dir)
+mstudy_mapping_fn <- sprintf("%s/MStudy_Mapping.082216.with_metadata.txt", out_dir)
+blast_fn <- sprintf("%s/BLAST_results.parsed.txt", out_dir)
+
+# Read in OTU table and mapping file
+seqtab.nochim <- readRDS(sprintf("%s/merged_seqtab.nochim.rds", out_dir))
+mapping <- read.table(full_mapping_fn, header=T, sep="\t", comment.char="", row.names=1)
+sel <- intersect(rownames(mapping), rownames(seqtab.nochim))
+mapping <- mapping[sel,]
+seqtab.nochim <- seqtab.nochim[sel,]
+mapping$NumReadsOTUTable <- rowSums(seqtab.nochim)[rownames(mapping)]
+mapping$SampleIDstr <- sprintf("%s (%d)", rownames(mapping), rowSums(seqtab.nochim)[rownames(mapping)])
+
+# load RDP/BLAST taxa
+taxa <- readRDS(sprintf("%s/DADA2_taxa.rds", out_dir))
+ps <- phyloseq(otu_table(t(seqtab.nochim), taxa_are_rows=TRUE), sample_data(mapping), tax_table(taxa))
+set.seed(prod(dim(seqtab.nochim)))
+
+# Read in the taxa coloring chart
+color_table <- read.table("data/taxa_coloring.txt", header=T, as.is=T, sep="\t", comment.char="")
+color_table$Family <- gsub("f__", "", color_table$Family)
+coloring <- color_table$Color
+names(coloring) <- color_table$Family
+ordering <- rev(names(coloring))
+cols <- colorRampPalette(c("white", "red"), space = "rgb")
+
+```
+
+***
+# QC
+### Evaluate controls
+First, let's evaluate our positive/negative controls.
+```{r evaluate_controls, eval=TRUE, warning=FALSE, message=FALSE, fig.cap="Taxa barplots of negative and positive controls. Numbers in parentheses indicate number of reads for each sample."}
+ps.sel <- subset_samples(ps, Treatment == "Control")
+mapping.sel <- as(sample_data(ps.sel), "data.frame")
+otu.filt <- normalizeByCols(as.data.frame(otu_table(ps.sel)))
+otu.filt$Family <- getTaxonomy(otus=rownames(otu.filt), tax_tab=tax_table(ps.sel), level="Family")
+agg <- aggregate(. ~ Family, otu.filt, sum)
+families <- agg$Family
+agg <- agg[,-1]
+agg <- normalizeByCols(agg)
+families[which(rowMeans(agg)<0.01)] <- "Other"
+agg$Family <- families
+df <- melt(agg, variable.name="SampleID")
+df2 <- aggregate(as.formula("value ~ Family + SampleID"), df, sum)
+df2$SampleType <- mapping.sel[as.character(df2$SampleID), "SampleType"]
+df2$SampleIDstr <- mapping.sel[as.character(df2$SampleID), "SampleIDstr"]
+ordering <- mapping.sel[order(mapping.sel$NumReadsOTUTable, decreasing=T), "SampleIDstr"]
+df2$SampleIDstr <- factor(df2$SampleIDstr, levels=ordering)
+p <- ggplot(df2, aes_string(x="SampleIDstr", y="value", fill="Family", order="Family")) + geom_bar(stat="identity", position="stack") + ylim(c(-0.1, 1.0)) + theme_classic() + theme(legend.position="right", axis.text.x = element_text(angle=90, vjust=0.5, hjust=1, size=8)) + scale_fill_manual(values=coloring) + ggtitle(sprintf("Negative.Control (ordered by NumReadsOTUTable)")) + guides(col = guide_legend(ncol = 3))
+print(p)
+```
+
+<br><br>
+Our negative controls appear to have quite a substantial number of reads. Let's see if we can reduce that by identifying contaminant SVs as those with more than 10% of their reads derived from negative controls. We can then evaluate the number of reads remaining after removing these contaminant SVs from our SV table.
+
+### Identify and remove contaminant SVs
+```{r remove_contaminants, eval=TRUE, warning=FALSE, message=FALSE, fig.cap="Read counts after removing contaminant SVs. Red bars indicate negative controls and black bars indicate true samples."}
+# identify and remove contaminant SVs as those with more than 2 std devs from mean in control samples
+otu_table <- as.matrix(as.data.frame(otu_table(ps.sel)))
+negids <- rownames(subset(mapping, SampleType %in% c("Negative", "NegativeSponge")))
+rs <- rowSums(otu_table[,negids])
+rs.true <- rowSums(otu_table(ps)[, setdiff(sample_names(ps), negids)])
+pct_blank <- 100* (rs / (rs + rs.true))
+hist(pct_blank, breaks=100)
+otus_to_remove <- names(which(pct_blank > 10))
+
+# read counts after removing contaminant SVs
+ps <- prune_taxa(setdiff(taxa_names(ps), otus_to_remove), ps)
+df <- melt(sample_sums(ps)); df$SampleID <- rownames(df); df <- df[order(df$value),]; df$SampleID <- factor(df$SampleID, levels=df$SampleID)
+df$SampleType <- ifelse(mapping.sel[as.character(df$SampleID), "SampleType"] %in% c("Negative", "NegativeSponge"), "Blank", "Sample")
+p <- ggplot(df, aes(x=SampleID, y=value, fill=SampleType)) + geom_bar(stat="identity") + theme_classic() + ggtitle("Read counts after contaminant SV removal") + scale_fill_manual(values=c("red", "black"))
+print(p)
+
+```
+That looks much better. The takeaway here is that we can nicely remove contaminant SVs based on their read count distribution between negative controls and true samples.
+
+
+***
+# Final setup
+Now that we have a nice and clean SV table to work from, let's finish getting our analyses set up. Let's prune our dataset to just the real samples to analyze and clean it up a bit. In detail, this means dropping a sample pair that had insufficient sequencing depth, imputing some missing metadata values, and adding propensity score columns.
+```{r final_setup, eval=TRUE, warning=FALSE, message=FALSE}
+# prune dataset to real samples
+mapping <- read.table(mstudy_mapping_fn, header=T, sep="\t", comment.char="", row.names=1)
+ps <- prune_samples(rownames(mapping), ps)
+sample_data(ps) <- sample_data(mapping[sample_names(ps),])
+
+# load metadata coding and typecast as needed
+metadata_variables <- read.table(sprintf("%s/metadata_types.120616.txt", out_dir), header=T, as.is=T, sep="\t", row.names=1)
+sel <- intersect(rownames(metadata_variables), colnames(mapping))
+metadata_variables <- metadata_variables[sel,, drop=F]
+mapping.sel <- mapping[rownames(sample_data(ps)), sel]
+for (mvar in rownames(metadata_variables)) {
+	if (metadata_variables[mvar, "type"] == "factor") {
+		mapping.sel[,mvar] <- factor(mapping.sel[,mvar])
+		if (metadata_variables[mvar, "baseline"] != "") {
+			mapping.sel[,mvar] <- relevel(mapping.sel[,mvar], metadata_variables[mvar, "baseline"])
+		}
+	} else if (metadata_variables[mvar, "type"] == "numeric") {
+		mapping.sel[,mvar] <- as.numeric(as.character(mapping.sel[,mvar]))
+	}
+}
+sample_data(ps) <- mapping.sel
+
+# keep only complete pairs
+tab <- table(mapping.sel$PID)
+pid_to_keep <- names(tab)[which(tab==2)]
+ps <- subset_samples(ps, PID %in% pid_to_keep)
+mapping.sel <- as(sample_data(ps), "data.frame")
+
+# define cytokine variables
+cytokines <- c(rownames(metadata_variables)[grepl("ml", rownames(metadata_variables), ignore.case=T)])
+cytokines <- rownames(subset(metadata_variables[cytokines,], type=="numeric" & useForNB=="yes"))
+
+# impute missing [ab_neutrophils, ab_neutrophils1, ab_cd4_helper2, viral_load_binned2] values
+mapping.sel[which(is.na(mapping.sel$ab_neutrophils)),"ab_neutrophils"] <- median(mapping.sel$ab_neutrophils, na.rm=T)
+mapping.sel[which(mapping.sel$ab_neutrophils1 == ""),"ab_neutrophils1"] <- "norm"; mapping.sel$ab_neutrophils1 <- droplevels(mapping.sel$ab_neutrophils1)
+mapping.sel[which(is.na(mapping.sel$ab_cd4_helper2)),"ab_cd4_helper2"] <- "[351,1e+04)"
+mapping.sel[which(is.na(mapping.sel$viral_load_binned2)), "viral_load_binned2"] <- "[0,1e+05)"
+sample_data(ps) <- mapping.sel
+
+# add propensity scores
+prop_scores <- read.csv(sprintf("%s/propensity_scores_102417.csv", out_dir), as.is=T)
+mapping.sel$prop_match <- paste(as.character(mapping.sel$PID), mapping.sel$visit_code, sep=".")
+prop_scores$match <- paste(prop_scores$PID, prop_scores$visit_code, sep=".")
+mapping.sel$PropensityScoreMeth <- prop_scores[match(mapping.sel$prop_match, prop_scores$match), "pslr_meth"]
+mapping.sel$PropensityScoreMarijuana <- prop_scores[match(mapping.sel$prop_match, prop_scores$match), "ps_mj"]
+mapping.sel$PropensityScoreRAI <- prop_scores[match(mapping.sel$prop_match, prop_scores$match), "ps_rai"]
+sample_data(ps) <- mapping.sel
+
+# rarefy and convert to relative abundance
+rare_depth <- min(sample_sums(ps))
+ps.rarefied <- rarefy_even_depth(ps, sample.size=rare_depth, rngseed=275)
+ps.relative <- transform_sample_counts(ps, function(x) x / sum(x) )
+
+# compute distance matrices
+dm <- list()
+for (distance_metric in distance_metrics) {
+	dm[[length(dm)+1]] <- as.matrix(distance(ps.relative, method=distance_metric))
+}
+names(dm) <- distance_metrics
+
+# thresholds for association tests
+nsamps_threshold <- 10 # number of reads to call a sample positive
+filt_threshold <- 0.1 # fraction of samples that need to be positive to keep an observation for association testing
+```
+
+
+***
+# Overview of microbiome data
+
+### PCoA
+Ok, getting down to business. First let's take a look at how our samples look using principal coordinates analysis (PCoA). Roughly speaking, this projects our samples into two dimensions based on the overall microbiome composition. Points closer to each other in space mean they have more similar compositions. We will only use the `Bray-Curtis` distance metric here for the sake of brevity.
+```{r pcoa, eval=TRUE, warning=FALSE, message=FALSE, fig.cap="PCoA with Bray-Curtis distance"}
+for (distance_metric in c("bray")) {
+	ordi <- ordinate(ps.relative, method = "PCoA", distance = distance_metric)
+	for (mvar in rownames(subset(metadata_variables, type=="factor" & useForPERMANOVA=="yes"))) {
+		p <- plot_ordination(ps.relative, ordi, "samples", color = mvar) + theme_classic() + ggtitle(distance_metric)
+		print(p)
+	}
+}
+```
+
+Perhaps unsurprisingly, there is no distinct clustering by any of our variables of interest. Let's try to quantify this effect using a technique called permutational analysis of variance (PERMANOVA). This will tell us how much our variables of interest (e.g. drug use, sexual practices) contribute to overall variation in microbiome composition. Because this approach treats covariates as additive, we will use a forward feature selection scheme to avoid biasing ourselves in favor of any particular variable.
+
+### PERMANOVA with forward feature selection
+```{r permanova, eval=TRUE, warning=FALSE, message=TRUE}
+for (distance_metric in c("bray")) {
+	print(sprintf("PERMANOVA on all samples - forward feature selection (%s)", distance_metric))
+	# keep removing rows (e.g. samples) with NAs as we select features
+	keep_going <- TRUE
+	selected_variables <- "PID"
+	remaining_variables <- setdiff(rownames(subset(metadata_variables, useForPERMANOVA=="yes")), selected_variables)
+	final <- {}
+	while (keep_going) {
+		res <- {}
+		for (mvar in remaining_variables) {
+			m <- mapping.sel[, c(selected_variables, mvar)]; m <- m[which(apply(m, 1, function(x) !any(is.na(x)))),]
+			dmsel <- dm[[distance_metric]][rownames(m), rownames(m)]
+			form <- as.formula(sprintf("as.dist(dmsel) ~ %s + %s", paste(selected_variables, collapse=" + "), mvar))
+			tmp <- adonis(form , data=m, permutations=999)
+			r2 <- tmp$aov.tab[mvar,"R2"] # get the R2 value for the new variable and store it
+			res <- c(res, r2)
+		}
+		names(res) <- remaining_variables
+		if (any(is.na(res))) {
+			res <- res[setdiff(1:length(res), which(is.na(res)))]
+		}
+		res <- sort(res, decreasing=T)
+		# if there are no more remaining variables with at least 1% additional variance, quit	
+		if (res[1] < 0.01) {
+			break
+		}
+		# otherwise, continue adding variables
+		print(sprintf("adding %s to existing model %s with R2=%.4g", names(res)[1], paste(selected_variables, collapse="+"), res[1]))
+		selected_variables <- c(selected_variables, names(res)[1])
+		remaining_variables <- setdiff(rownames(subset(metadata_variables, useForPERMANOVA=="yes")), selected_variables)
+	}
+	print("PERMANOVA on all samples - final model")
+	print(selected_variables)
+	form <- as.formula(sprintf("dm.sel ~ %s", paste(selected_variables, collapse="+")))
+	inds <- which(apply(mapping.sel[,selected_variables], 1, function(x) !any(is.na(x))))
+	dm.sel <- dm[[distance_metric]][names(inds), names(inds)]
+	res <- adonis(form , data=mapping.sel[inds,], permutations=999)
+	print(res)
+}
+```
+
+Unsurprisingly, PID (R^2^=`r sprintf("%.3g", res$aov.tab["PID", "R2"])`) (inter-personal) variation dominates the microbiome. Other important covariates are Q157_1_binned (methamphetamine use, R^2^=`r sprintf("%.3g", res$aov.tab["Q157_1_binned", "R2"])`) and Q103_BINARY (oral semen exposure, R^2^=`r sprintf("%.3g", res$aov.tab["Q103_BINARY", "R2"])`). Finally, let's look at the overall taxonomic composition of our samples.
+
+***
+### Taxa barplots
+```{r taxa_barplots, eval=TRUE, warning=FALSE, message=FALSE, fig.cap="Taxa barplots of all samples (Family level)", fig.height=8, fig.width=12}
+ordi <- ordinate(ps.relative, method = "PCoA", distance = "bray")
+ordering.pc1 <- names(sort(ordi$vectors[,"Axis.1"]))
+pids_by_pc1 <- unique(unlist(lapply(ordering.pc1, function(x) unlist(strsplit(x, "\\."))[1])))
+ordering.pc1_PID <- unlist(lapply(pids_by_pc1, function(pid) {
+	intersect(ordering.pc1, rownames(subset(mapping.sel, PID==pid)))
+}))
+otu.filt <- as.data.frame(otu_table(ps.relative))
+otu.filt$Family <- getTaxonomy(otus=rownames(otu.filt), tax_tab=tax_table(ps.relative), level="Family")
+agg <- aggregate(. ~ Family, otu.filt, sum)
+families <- agg$Family
+agg <- agg[,-1]
+agg <- normalizeByCols(agg)
+families[which(rowMeans(agg)<0.01)] <- "Other"
+agg$Family <- families
+df <- melt(agg, variable.name="SampleID")
+df2 <- aggregate(as.formula("value ~ Family + SampleID"), df, sum)
+df2$SampleID <- factor(as.character(df2$SampleID), levels=ordering.pc1)
+df2$SampleID_PID <- factor(as.character(df2$SampleID), levels=ordering.pc1_PID)
+p <- ggplot(df2, aes_string(x="SampleID", y="value", fill="Family", order="Family")) + geom_bar(stat="identity", position="stack") + ylim(c(-0.1, 1.0)) + theme_classic() + theme(legend.position="right", axis.text.x = element_text(angle=90, vjust=0.5, hjust=1, size=8)) + scale_fill_manual(values=coloring) + ggtitle(sprintf("Taxa barplots overall (ordered by PC1)")) + guides(col = guide_legend(ncol = 3))
+print(p)
+```
+
+```{r taxa_barplots_by_PID, eval=TRUE, warning=FALSE, message=FALSE, fig.cap="Taxa barplots of all samples (Family level, ordered by PID)", fig.height=8, fig.width=12}
+p <- ggplot(df2, aes_string(x="SampleID_PID", y="value", fill="Family", order="Family")) + geom_bar(stat="identity", position="stack") + ylim(c(-0.1, 1.0)) + theme_classic() + theme(legend.position="right", axis.text.x = element_text(angle=90, vjust=0.5, hjust=1, size=8)) + scale_fill_manual(values=coloring) + ggtitle(sprintf("Taxa barplots overall (ordered by PID+PC1)")) + guides(col = guide_legend(ncol = 3)) + geom_vline(xintercept=seq(from=2.5, to=nlevels(df2$SampleID_PID), by=2))
+print(p)
+```
+
+***
+### Sample-to-sample distances (beta diversity)
+One other thing to check is that the sample-to-sample distances are within each PID group versus across PIDs. We'll do that as follows:
+```{r beta_diversity, eval=TRUE, warning=FALSE, message=FALSE, fig.cap="Bray-Curtis distance within/between PID"}
+## beta diversity (distance) within/between PID
+pairs <- as.data.frame(t(combn(rownames(mapping.sel), 2))); colnames(pairs) <- c("s1", "s2")
+pairs$s1 <- as.character(pairs$s1); pairs$s2 <- as.character(pairs$s2)
+pairs$PID1 <- mapping.sel[pairs$s1, "PID"]; pairs$PID2 <- mapping.sel[pairs$s2, "PID"]
+pairs$Group <- ifelse(pairs$PID1==pairs$PID2, "Within", "Between")
+for (distance_metric in c("bray")) {
+	pairs[, distance_metric] <- dm[[distance_metric]][cbind(pairs$s1, pairs$s2)]
+	test <- wilcox.test(as.formula(sprintf("%s ~ Group", distance_metric)), pairs)
+	p <- ggplot(pairs, aes_string(x="Group", y=distance_metric)) + geom_boxplot() + theme_classic() + ggtitle(sprintf("%s by Within/Between PID (Wilcoxon p=%.4g)", distance_metric, test$p.value))
+	print(p)
+}
+```
+
+***
+### Alpha diversity
+Next, we will look to see if alpha (within-sample) diversity changes with respect to any of our variables of interest. Note that the p-values shown in the figures below are **unadjusted**. FDR-corrected p-values are calculated in the next section.
+```{r alpha_diversity, eval=TRUE, warning=FALSE, message=FALSE}
+adiv <- estimate_richness(ps.rarefied, measures=alpha_metrics)[, alpha_metrics]
+adiv$SampleID <- rownames(adiv)
+adiv_res <- {}
+for (mvar in rownames(subset(metadata_variables, useForNB=="yes"))) {
+	df <- melt(adiv)
+	df[,mvar] <- mapping.sel[df$SampleID, mvar]
+	tmp <- {}
+	ypos <- {}
+	for (metric in alpha_metrics) {
+		if (is.factor(df[,mvar]) && length(unique(df[,mvar]))>1) {
+			test <- kruskal.test(as.formula(sprintf("value ~ %s", mvar)), subset(df, variable==metric))
+			tmp <- rbind(tmp, c(mvar, metric, test$statistic, test$p.value))
+		} else if (is.numeric(df[,mvar])) {
+			test <- cor.test(as.formula(sprintf("~ value + %s", mvar)), subset(df, variable==metric), method="spearman")
+			tmp <- rbind(tmp, c(mvar, metric, test$estimate, test$p.value))
+		} 
+		else {
+			tmp <- c(tmp, NA)
+		}
+		ypos <- c(ypos, max(subset(df, variable==metric)$value)*0.8)
+	}
+	adiv_res <- rbind(adiv_res, tmp)
+	tmp <- sprintf("estimate=%.4g p=%.4g", as.numeric(tmp[,3]), as.numeric(tmp[,4]))
+	pval_labeller <- function(variable,value){
+		return(sprintf("%s %s", tmp[value], value))
+	}
+	
+	if (metadata_variables[mvar, "type"] == "factor") {
+		p <- ggplot(df, aes_string(x=mvar, y="value")) + geom_boxplot() + facet_wrap(~variable, scales="free", labeller=pval_labeller) + theme_classic() + ggtitle(sprintf("Alpha diversity by %s", mvar)) + theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1))
+		print(p)
+	} else if (metadata_variables[mvar, "type"] == "numeric") {
+		p <- ggplot(df, aes_string(x=mvar, y="value")) + geom_point() + stat_smooth(method="lm") + facet_wrap(~variable, scales="free", labeller=pval_labeller) + theme_classic() + ggtitle(sprintf("Alpha diversity by %s", mvar))
+		print(p)
+	}
+}
+```
+
+Because we know that we should correct for multiple comparisons, let's also get a table of FDR-corrected p-values.
+```{r alpha_diversity_table, eval=TRUE, warning=FALSE, message=TRUE}
+adiv_res <- as.data.frame(adiv_res); colnames(adiv_res) <- c("metadata_variable", "metric", "estimate", "pvalue")
+adiv_res$pvalue <- as.numeric(as.character(adiv_res$pvalue))
+adiv_res$padj <- p.adjust(adiv_res$pvalue, method="fdr")
+adiv_res <- adiv_res[order(adiv_res$padj),]
+head(adiv_res)
+```
+
+
+***
+# Taxonomic signatures of drug use and sexual behaviors
+We'd also like to know if specific bacterial taxa are either increased or decreased in relation to our variables of interest. To do this, we'll use zero-inflated negative binomial (ZINB) regression models. These two-step models account for the sparsity of microbiome (16S) data and have been shown to perform fairly well in benchmark studies ([here](https://doi.org/10.1186/s40168-016-0208-8) and [here](https://doi.org/10.1093/bib/bbx104)). We will also control for `PID`, `CD4 count`, and `HIV viral load` in the regression analyses as these are known confounders.
+
+### SV level
+```{r ZINB_SV, eval=TRUE, warning=FALSE, message=TRUE}
+# taxa significance - SV level (ZINB, controlling for PID+ab_cd4_helper+viral_load)
+otu.filt <- as.data.frame(otu_table(ps.rarefied))
+agg <- otu.filt
+ftk <- names(which(rowSums(agg)>=100))
+ftk2 <- names(which(unlist(apply(agg, 1, function(x) length(which(x>=nsamps_threshold)))) > ceiling(filt_threshold*ncol(agg))))
+agg <- agg[intersect(ftk,ftk2),] # filter out less than 100 reads to reduce testing burden and improve model fit
+agg$OTU <- rownames(agg)
+out <- mclapply(agg$OTU, function(f) {
+	df <- melt(agg[f,]); colnames(df) <- c("OTU", "SampleID", "value"); df$SampleID <- as.character(df$SampleID)
+	tmp <- {}
+	print(f)
+	for (mvar in rownames(subset(metadata_variables, useForNB=="yes"))) {
+		df2 <- df
+		df2[, mvar] <- mapping.sel[df2$SampleID, mvar]
+		df2$PID <- mapping.sel[df2$SampleID, "PID"]
+		df2$ab_cd4_helper <- mapping.sel[df$SampleID, "ab_cd4_helper"]
+		df2$viral_load <- mapping.sel[df$SampleID, "viral_load"]
+		tt <- try(m <- zeroinfl(as.formula(sprintf("value ~ %s + PID + ab_cd4_helper + viral_load | 1", mvar)), data = df2, dist = "negbin", EM = FALSE, maxit=100), silent=T) # using EM=TRUE causes certain models to hang...
+		if (class(tt) == "zeroinfl") {
+			coef <- summary(m)$coefficients$count # rows are [(Intercept), comparisons, Log(theta)], columns are [Estimate, SE, Z, pval]
+			coef <- coef[setdiff(1:nrow(coef), grep("PID", rownames(coef))),,drop=FALSE]
+			coef <- coef[setdiff(rownames(coef), c("ab_cd4_helper", "viral_load")),,drop=FALSE]
+			tmp <- rbind(tmp, cbind(f, paste(tax_table(ps.rarefied)[f,1:7], collapse=","), mvar, class(mapping.sel[,mvar]), "ZINB", rownames(coef), coef))
+		} else if (class(tt) == "try-error") {
+			tt <- try(m <- glm.nb(as.formula(sprintf("value ~ %s + PID + ab_cd4_helper + viral_load", mvar)), data = df2), silent=T)
+			if (class(tt)[1] == "negbin") { 
+				coef <- summary(m)$coefficients # rows are [(Intercept), comparisons], columns are [Estimate, SE, Z, pval]
+				coef <- coef[setdiff(1:nrow(coef), grep("PID", rownames(coef))),,drop=FALSE]
+				coef <- coef[setdiff(rownames(coef), c("ab_cd4_helper", "viral_load")),,drop=FALSE]
+				tmp <- rbind(tmp, cbind(f, paste(tax_table(ps.rarefied)[f,1:7], collapse=","), mvar, class(mapping.sel[,mvar]), "NB", rownames(coef), coef))
+			}
+		}
+	}
+	print(sprintf("finished %s", f))
+	tmp
+}, mc.cores=16)
+res <- as.data.frame(do.call(rbind, out))
+colnames(res) <- c("OTU", "taxonomy", "metadata_variable", "class", "method", "coefficient", "Estimate", "SE", "Z", "pvalue")
+res <- subset(res, !coefficient %in% c("(Intercept)", "Log(theta)")) # remove intercept and log-theta terms before FDR correction
+res$pvalue <- as.numeric(as.character(res$pvalue))
+# p-value adjust
+res$padj <- p.adjust(res$pvalue, method="fdr")
+res <- res[order(res$padj, decreasing=F),]
+resSig <- subset(res, padj<0.05)
+# save these results somewhere using write.table(...)
+# format for heatmap representation
+resSig$Estimate <- as.numeric(as.character(resSig$Estimate))
+resSig$EstimateWeight <- ifelse(is.na(resSig$Estimate), 0.5, resSig$Estimate)
+resSig$EstimateColor <- ifelse(resSig$Estimate>0, "red", "blue"); resSig$EstimateColor[which(is.na(resSig$EstimateColor))] <- "black"
+```
+
+```{r ZINB_SV_drug_heatmap, eval=TRUE, warning=FALSE, message=TRUE, fig.cap="Associations between drug use variables and bacterial SVs. Red indicates positive associations and blue indicates negative associations.", fig.height=8, fig.width=12}
+drugs <- c("Q157_1_binned", "Q157_2_binned", "Q157_3_binned", "Q157_4_binned", "Q157_5_binned", "Q157_6_binned", "Q157_7_binned", "Q157_8_binned", "Q157_9_binned", "Q157_10_binned", "Q157_11_binned")
+resSig.drugs <- subset(resSig, metadata_variable %in% drugs)
+df <- dcast(resSig.drugs, OTU ~ coefficient, value.var="Z"); rownames(df) <- df$OTU; df <- df[,-1]; df <- data.matrix(df)
+df[which(df>10, arr.ind=T)] <- 10 # censor at 10
+df[which(df< -10, arr.ind=T)] <- -10 # censor at -10
+df2 <- df; df2[which(is.na(df2), arr.ind=T)] <- 0
+heatmap.2(t(df2), Rowv=T, Colv=T, dendrogram="both", trace="none", col=colorRampPalette(c("blue", "white","red"))(150), margins=c(10,10), cexCol=0.8, cexRow=0.8, sepwidth=c(0.02,0.02), colsep=1:ncol(df), rowsep=1:nrow(df), sepcolor="grey")
+```
+```{r ZINB_SV_sex_heatmap, eval=TRUE, warning=FALSE, message=TRUE, fig.cap="Associations between sexual behavior variables and bacterial SVs. Red indicates positive associations and blue indicates negative associations.", fig.height=8, fig.width=12}
+sex <- c("Q99_BINARY", "Q103_BINARY", "Q104_BINARY", "Q151", "anygonorrhea")
+resSig.sex <- subset(resSig, metadata_variable %in% sex)
+df <- dcast(resSig.sex, OTU ~ coefficient, value.var="Z"); rownames(df) <- df$OTU; df <- df[,-1]; df <- data.matrix(df)
+df[which(df>10, arr.ind=T)] <- 10 # censor at 10
+df[which(df< -10, arr.ind=T)] <- -10 # censor at -10
+df2 <- df; df2[which(is.na(df2), arr.ind=T)] <- 0
+heatmap.2(t(df2), Rowv=T, Colv=T, dendrogram="both", trace="none", col=colorRampPalette(c("blue", "white","red"))(150), margins=c(10,10), cexCol=0.8, cexRow=0.8, sepwidth=c(0.02,0.02), colsep=1:ncol(df), rowsep=1:nrow(df), sepcolor="grey")
+```
+
+### Genus level
+```{r ZINB_Genus, eval=TRUE, warning=FALSE, message=TRUE}
+# taxa significance - Genus level (ZINB, controlling for PID+ab_cd4_helper+viral_load)
+otu.filt <- as.data.frame(otu_table(ps.rarefied))
+otu.filt$Genus <- getTaxonomy(otus=rownames(otu.filt), tax_tab=tax_table(ps.rarefied), level="Genus")
+agg <- aggregate(. ~ Genus, otu.filt, sum)
+genera <- agg$Genus
+agg <- agg[,-1]
+rownames(agg) <- genera
+ftk <- names(which(rowSums(agg)>=100))
+ftk2 <- names(which(unlist(apply(agg, 1, function(x) length(which(x>=nsamps_threshold)))) > ceiling(filt_threshold*ncol(agg))))
+agg <- agg[intersect(ftk,ftk2),] # filter out less than 100 reads to reduce testing burden and improve model fit
+# zero-inflated negative binomial or negative binomial regression
+agg$Genus <- rownames(agg)
+res2 <- {}
+out <- mclapply(agg$Genus, function(f) {
+	df <- melt(agg[f,]); colnames(df) <- c("Genus", "SampleID", "value"); df$SampleID <- as.character(df$SampleID)
+	tmp <- {}
+	print(f)
+	nsamps_detected <- length(which(df$value>=nsamps_threshold))
+	nsubjs_detected <- length(unique(mapping.sel[subset(df, value>=nsamps_threshold)$SampleID, "PID"]))
+	for (mvar in rownames(subset(metadata_variables, useForNB=="yes"))) {
+		df2 <- df
+		df2[, mvar] <- mapping.sel[df2$SampleID, mvar]
+		df2$PID <- mapping.sel[df2$SampleID, "PID"]
+		df2$ab_cd4_helper <- mapping.sel[df$SampleID, "ab_cd4_helper"]
+		df2$viral_load <- mapping.sel[df$SampleID, "viral_load"]
+		tt <- try(m <- zeroinfl(as.formula(sprintf("value ~ %s + PID + ab_cd4_helper + viral_load | 1", mvar)), data = df2, dist = "negbin", EM = FALSE, maxit=100), silent=T) # using EM=TRUE causes certain models to hang...
+		if (class(tt) == "zeroinfl") {
+			coef <- summary(m)$coefficients$count # rows are [(Intercept), comparisons, Log(theta)], columns are [Estimate, SE, Z, pval]
+			coef <- coef[setdiff(1:nrow(coef), grep("PID", rownames(coef))),,drop=FALSE]
+			coef <- coef[setdiff(rownames(coef), c("ab_cd4_helper", "viral_load")),,drop=FALSE]
+			tmp <- rbind(tmp, cbind(f, f, nsamps_detected, nsubjs_detected, mvar, class(mapping.sel[,mvar]), "ZINB", rownames(coef), coef))
+		} else if (class(tt) == "try-error") {
+			tt <- try(m <- glm.nb(as.formula(sprintf("value ~ %s + PID + ab_cd4_helper + viral_load", mvar)), data = df2), silent=T)
+			if (class(tt)[1] == "negbin") { 
+				coef <- summary(m)$coefficients # rows are [(Intercept), comparisons], columns are [Estimate, SE, Z, pval]
+				coef <- coef[setdiff(1:nrow(coef), grep("PID", rownames(coef))),,drop=FALSE]
+				coef <- coef[setdiff(rownames(coef), c("ab_cd4_helper", "viral_load")),,drop=FALSE]
+				tmp <- rbind(tmp, cbind(f, f, nsamps_detected, nsubjs_detected, mvar, class(mapping.sel[,mvar]), "NB", rownames(coef), coef))
+			}
+		}
+	}
+	print(sprintf("finished %s", f))
+	tmp
+}, mc.cores=16)
+res <- as.data.frame(do.call(rbind, out))
+colnames(res) <- c("OTU", "taxonomy", "nsamps_detected", "nsubjs_detected", "metadata_variable", "class", "method", "coefficient", "Estimate", "SE", "Z", "pvalue")
+res <- subset(res, !coefficient %in% c("(Intercept)", "Log(theta)")) # remove intercept and log-theta terms before FDR correction
+res$pvalue <- as.numeric(as.character(res$pvalue))
+res$padj <- p.adjust(res$pvalue, method="fdr")
+res <- res[order(res$padj, decreasing=F),]
+resSig <- subset(res, padj<0.05)
+# save these results somewhere using write.table(...)
+# format for heatmap representation
+resSig$Estimate <- as.numeric(as.character(resSig$Estimate))
+resSig$EstimateWeight <- ifelse(is.na(resSig$Estimate), 0.5, resSig$Estimate)
+resSig$EstimateColor <- ifelse(resSig$Estimate>0, "red", "blue"); resSig$EstimateColor[which(is.na(resSig$EstimateColor))] <- "black"
+```
+
+```{r ZINB_Genus_drug_heatmap, eval=TRUE, warning=FALSE, message=TRUE, fig.cap="Associations between drug use variables and bacterial genera. Red indicates positive associations and blue indicates negative associations.", fig.height=8, fig.width=12}
+drugs <- c("Q157_1_binned", "Q157_2_binned", "Q157_3_binned", "Q157_4_binned", "Q157_5_binned", "Q157_6_binned", "Q157_7_binned", "Q157_8_binned", "Q157_9_binned", "Q157_10_binned", "Q157_11_binned")
+resSig.drugs <- subset(resSig, metadata_variable %in% drugs)
+df <- dcast(resSig.drugs, OTU ~ coefficient, value.var="Estimate"); rownames(df) <- df$OTU; df <- df[,-1]; df <- data.matrix(df)
+df[which(df>10, arr.ind=T)] <- 10 # censor at 10
+df[which(df< -10, arr.ind=T)] <- -10 # censor at -10
+df2 <- df; df2[which(is.na(df2), arr.ind=T)] <- 0
+heatmap.2(t(df2), Rowv=T, Colv=T, dendrogram="both", trace="none", col=colorRampPalette(c("blue", "white","red"))(150), margins=c(10,10), cexCol=0.8, cexRow=0.8, sepwidth=c(0.02,0.02), colsep=1:ncol(df), rowsep=1:nrow(df), sepcolor="grey")
+```
+```{r ZINB_Genus_sex_heatmap, eval=TRUE, warning=FALSE, message=TRUE, fig.cap="Associations between sexual behavior variables and bacterial genera. Red indicates positive associations and blue indicates negative associations.", fig.height=8, fig.width=12}
+sex <- c("Q99_BINARY", "Q103_BINARY", "Q104_BINARY", "Q151", "anygonorrhea")
+resSig.sex <- subset(resSig, metadata_variable %in% sex)
+df <- dcast(resSig.sex, OTU ~ coefficient, value.var="Z"); rownames(df) <- df$OTU; df <- df[,-1]; df <- data.matrix(df)
+df[which(df>10, arr.ind=T)] <- 10 # censor at 10
+df[which(df< -10, arr.ind=T)] <- -10 # censor at -10
+df2 <- df; df2[which(is.na(df2), arr.ind=T)] <- 0
+heatmap.2(t(df2), Rowv=T, Colv=T, dendrogram="both", trace="none", col=colorRampPalette(c("blue", "white","red"))(150), margins=c(10,10), cexCol=0.8, cexRow=0.8, sepwidth=c(0.02,0.02), colsep=1:ncol(df), rowsep=1:nrow(df), sepcolor="grey")
+```
+
+
+### Family level
+```{r ZINB_Family, eval=TRUE, warning=FALSE, message=TRUE}
+# taxa significance - Family level (ZINB, controlling for PID+ab_cd4_helper+viral_load)
+otu.filt <- as.data.frame(otu_table(ps.rarefied))
+otu.filt$Family <- getTaxonomy(otus=rownames(otu.filt), tax_tab=tax_table(ps.rarefied), level="Family")
+agg <- aggregate(. ~ Family, otu.filt, sum)
+families <- agg$Family
+agg <- agg[,-1]
+rownames(agg) <- families
+ftk <- names(which(rowSums(agg)>=100))
+ftk2 <- names(which(unlist(apply(agg, 1, function(x) length(which(x>=nsamps_threshold)))) > ceiling(filt_threshold*ncol(agg))))
+agg <- agg[intersect(ftk,ftk2),] # filter out less than 100 reads to reduce testing burden and improve model fit
+# zero-inflated negative binomial or negative binomial regression
+agg$Family <- rownames(agg)
+res2 <- {}
+out <- mclapply(agg$Family, function(f) {
+	df <- melt(agg[f,]); colnames(df) <- c("Family", "SampleID", "value"); df$SampleID <- as.character(df$SampleID)
+	tmp <- {}
+	print(f)
+	nsamps_detected <- length(which(df$value>=nsamps_threshold))
+	nsubjs_detected <- length(unique(mapping.sel[subset(df, value>=nsamps_threshold)$SampleID, "PID"]))
+	for (mvar in rownames(subset(metadata_variables, useForNB=="yes"))) {
+		df2 <- df
+		df2[, mvar] <- mapping.sel[df2$SampleID, mvar]
+		df2$PID <- mapping.sel[df2$SampleID, "PID"]
+		df2$ab_cd4_helper <- mapping.sel[df$SampleID, "ab_cd4_helper"]
+		df2$viral_load <- mapping.sel[df$SampleID, "viral_load"]
+		tt <- try(m <- zeroinfl(as.formula(sprintf("value ~ %s + PID + ab_cd4_helper + viral_load | 1", mvar)), data = df2, dist = "negbin", EM = FALSE, maxit=100), silent=T) # using EM=TRUE causes certain models to hang...
+		if (class(tt) == "zeroinfl") {
+			coef <- summary(m)$coefficients$count # rows are [(Intercept), comparisons, Log(theta)], columns are [Estimate, SE, Z, pval]
+			coef <- coef[setdiff(1:nrow(coef), grep("PID", rownames(coef))),,drop=FALSE]
+			coef <- coef[setdiff(rownames(coef), c("ab_cd4_helper", "viral_load")),,drop=FALSE]
+			tmp <- rbind(tmp, cbind(f, f, nsamps_detected, nsubjs_detected, mvar, class(mapping.sel[,mvar]), "ZINB", rownames(coef), coef))
+		} else if (class(tt) == "try-error") {
+			tt <- try(m <- glm.nb(as.formula(sprintf("value ~ %s + PID + ab_cd4_helper + viral_load", mvar)), data = df2), silent=T)
+			if (class(tt)[1] == "negbin") { 
+				coef <- summary(m)$coefficients # rows are [(Intercept), comparisons], columns are [Estimate, SE, Z, pval]
+				coef <- coef[setdiff(1:nrow(coef), grep("PID", rownames(coef))),,drop=FALSE]
+				coef <- coef[setdiff(rownames(coef), c("ab_cd4_helper", "viral_load")),,drop=FALSE]
+				tmp <- rbind(tmp, cbind(f, f, nsamps_detected, nsubjs_detected, mvar, class(mapping.sel[,mvar]), "NB", rownames(coef), coef))
+			}
+		}
+	}
+	print(sprintf("finished %s", f))
+	tmp
+}, mc.cores=16)
+res <- as.data.frame(do.call(rbind, out))
+colnames(res) <- c("OTU", "taxonomy", "nsamps_detected", "nsubjs_detected",  "metadata_variable", "class", "method", "coefficient", "Estimate", "SE", "Z", "pvalue")
+res <- subset(res, !coefficient %in% c("(Intercept)", "Log(theta)")) # remove intercept and log-theta terms before FDR correction
+res$pvalue <- as.numeric(as.character(res$pvalue))
+res$padj <- p.adjust(res$pvalue, method="fdr")
+res <- res[order(res$padj, decreasing=F),]
+resSig <- subset(res, padj<0.05)
+# save these results somewhere using write.table(...)
+# format for heatmap representation
+resSig$Estimate <- as.numeric(as.character(resSig$Estimate))
+resSig$EstimateWeight <- ifelse(is.na(resSig$Estimate), 0.5, resSig$Estimate)
+resSig$EstimateColor <- ifelse(resSig$Estimate>0, "red", "blue"); resSig$EstimateColor[which(is.na(resSig$EstimateColor))] <- "black"
+```
+
+```{r ZINB_Family_drug_heatmap, eval=TRUE, warning=FALSE, message=TRUE, fig.cap="Associations between drug use variables and bacterial families. Red indicates positive associations and blue indicates negative associations.", fig.height=8, fig.width=12}
+drugs <- c("Q157_1_binned", "Q157_2_binned", "Q157_3_binned", "Q157_4_binned", "Q157_5_binned", "Q157_6_binned", "Q157_7_binned", "Q157_8_binned", "Q157_9_binned", "Q157_10_binned", "Q157_11_binned")
+resSig.drugs <- subset(resSig, metadata_variable %in% drugs)
+df <- dcast(resSig.drugs, OTU ~ coefficient, value.var="Z"); rownames(df) <- df$OTU; df <- df[,-1]; df <- data.matrix(df)
+df[which(df>10, arr.ind=T)] <- 10 # censor at 10
+df[which(df< -10, arr.ind=T)] <- -10 # censor at -10
+df2 <- df; df2[which(is.na(df2), arr.ind=T)] <- 0
+heatmap.2(t(df2), Rowv=T, Colv=T, dendrogram="both", trace="none", col=colorRampPalette(c("blue", "white","red"))(150), margins=c(10,10), cexCol=0.8, cexRow=0.8, sepwidth=c(0.02,0.02), colsep=1:ncol(df), rowsep=1:nrow(df), sepcolor="grey")
+```
+```{r ZINB_Family_sex_heatmap, eval=TRUE, warning=FALSE, message=TRUE, fig.cap="Associations between sexual behavior variables and bacterial families. Red indicates positive associations and blue indicates negative associations.", fig.height=8, fig.width=12}
+sex <- c("Q99_BINARY", "Q103_BINARY", "Q104_BINARY", "Q151", "anygonorrhea")
+resSig.sex <- subset(resSig, metadata_variable %in% sex)
+df <- dcast(resSig.sex, OTU ~ coefficient, value.var="Z"); rownames(df) <- df$OTU; df <- df[,-1]; df <- data.matrix(df)
+df[which(df>10, arr.ind=T)] <- 10 # censor at 10
+df[which(df< -10, arr.ind=T)] <- -10 # censor at -10
+df2 <- df; df2[which(is.na(df2), arr.ind=T)] <- 0
+heatmap.2(t(df2), Rowv=T, Colv=T, dendrogram="both", trace="none", col=colorRampPalette(c("blue", "white","red"))(150), margins=c(10,10), cexCol=0.8, cexRow=0.8, sepwidth=c(0.02,0.02), colsep=1:ncol(df), rowsep=1:nrow(df), sepcolor="grey")
+```
+
+# Propensity scores
+Another way to control for potential confounders is to use propensity scores. These have already been precomputed [here](data/propensity_scores_102417.csv). We'll then repeat the zero-inflated negative binomial regression using these propensity scores as a covariate.
+
+```{r ZINB_PS_Genus, eval=TRUE, warning=FALSE, message=TRUE}
+propensity_score_strings <- c("PropensityScoreMeth", "PropensityScoreMarijuana", "PropensityScoreRAI")
+names(propensity_score_strings) <- c("Q157_1_binned", "Q157_7_binned", "Q99_BINARY")
+otu.filt <- as.data.frame(otu_table(ps.rarefied))
+otu.filt$Genus <- as.character(as.data.frame(tax_table(ps)[rownames(otu.filt), "Genus"])$Genus)
+agg <- aggregate(. ~ Genus, otu.filt, sum)
+genera <- agg$Genus
+agg <- agg[,-1]
+rownames(agg) <- genera
+ftk <- names(which(rowSums(agg)>=100))
+ftk2 <- names(which(unlist(apply(agg, 1, function(x) length(which(x>=nsamps_threshold)))) > ceiling(filt_threshold*ncol(agg))))
+agg <- agg[intersect(ftk,ftk2),]
+# zero-inflated negative binomial or negative binomial regression
+agg$Genus <- rownames(agg)
+out <- mclapply(agg$Genus, function(f) {
+	df <- melt(agg[f,]); colnames(df) <- c("Genus", "SampleID", "value"); df$SampleID <- as.character(df$SampleID)
+	tmp <- {}
+	print(f)
+	nsamps_detected <- length(which(df$value>=nsamps_threshold))
+	nsubjs_detected <- length(unique(mapping.sel[subset(df, value>=nsamps_threshold)$SampleID, "PID"]))
+	for (mvar in names(propensity_score_strings)) {
+		#print(sprintf("%s %s", f, mvar))
+		df2 <- df
+		df2[, mvar] <- mapping.sel[df2$SampleID, mvar]
+		df2$PID <- mapping.sel[df2$SampleID, "PID"]
+		df2$PropensityScore <- mapping.sel[df$SampleID, propensity_score_strings[mvar]]
+		tt <- try(m <- zeroinfl(as.formula(sprintf("value ~ %s + PID + PropensityScore | 1", mvar)), data = df2, dist = "negbin", EM = FALSE, maxit=100), silent=T) # using EM=TRUE causes certain models to hang...
+		if (class(tt) == "zeroinfl") {
+			coef <- summary(m)$coefficients$count # rows are [(Intercept), comparisons, Log(theta)], columns are [Estimate, SE, Z, pval]
+			coef <- coef[setdiff(1:nrow(coef), grep("PID", rownames(coef))),,drop=FALSE]
+			coef <- coef[setdiff(rownames(coef), c("PropensityScore")),,drop=FALSE]
+			tmp <- rbind(tmp, cbind(f, f, nsamps_detected, nsubjs_detected, mvar, class(mapping.sel[,mvar]), "ZINB", rownames(coef), coef))
+		} else if (class(tt) == "try-error") {
+			tt <- try(m <- glm.nb(as.formula(sprintf("value ~ %s + PID + PropensityScore", mvar)), data = df2), silent=T)
+			if (class(tt)[1] == "negbin") { 
+				coef <- summary(m)$coefficients # rows are [(Intercept), comparisons], columns are [Estimate, SE, Z, pval]
+				coef <- coef[setdiff(1:nrow(coef), grep("PID", rownames(coef))),,drop=FALSE]
+				coef <- coef[setdiff(rownames(coef), c("PropensityScore")),,drop=FALSE]
+				tmp <- rbind(tmp, cbind(f, f, nsamps_detected, nsubjs_detected, mvar, class(mapping.sel[,mvar]), "NB", rownames(coef), coef))
+			}
+		}
+		#print(sprintf("finished %s %s", f, mvar))
+	}
+	print(sprintf("finished %s", f))
+	tmp
+}, mc.cores=16)
+res <- as.data.frame(do.call(rbind, out))
+colnames(res) <- c("OTU", "taxonomy", "nsamps_detected", "nsubjs_detected", "metadata_variable", "class", "method", "coefficient", "Estimate", "SE", "Z", "pvalue")
+res <- subset(res, !coefficient %in% c("(Intercept)", "Log(theta)")) # remove intercept and log-theta terms before FDR correction
+res$pvalue <- as.numeric(as.character(res$pvalue))
+# p-value adjust
+res$padj <- p.adjust(res$pvalue, method="fdr")
+res <- res[order(res$padj, decreasing=F),]
+```
+
+```{r ZINB_PS_Genus_heatmap, eval=TRUE, warning=FALSE, message=TRUE, fig.cap="Associations between selected variables and bacterial families with propensity score covariates. Red indicates positive associations and blue indicates negative associations.", fig.height=8, fig.width=12}
+res$Estimate <- as.numeric(as.character(res$Estimate)); res$Z <- as.numeric(as.character(res$Z)); res$EstimateWeight <- ifelse(is.na(res$Estimate), 0.5, res$Estimate)
+res$EstimateColor <- ifelse(res$Estimate>0, "red", "blue"); res$EstimateColor[which(is.na(res$EstimateColor))] <- "black"
+resSig <- subset(res, padj<0.05)
+df <- dcast(resSig, OTU ~ coefficient, value.var="Z"); rownames(df) <- df$OTU; df <- df[,-1]; df <- t(as.matrix(df))
+df[which(df>3, arr.ind=T)] <- 3 # censor at 3
+df[which(df< -3, arr.ind=T)] <- -3 # censor at -3
+df2 <- df; df2[which(is.na(df2))] <- 0
+heatmap.2(df2, Rowv=T, Colv=T, dendrogram="both", trace="none", col=colorRampPalette(c("blue", "white","red"))(150), margins=c(10,10), cexCol=0.8, cexRow=0.8, sepwidth=c(0.02,0.02), colsep=1:ncol(df), rowsep=1:nrow(df), sepcolor="grey")
+```
+
